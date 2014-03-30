@@ -31,8 +31,16 @@
 #include <linux/debugfs.h>
 #endif
 #include <linux/sched.h>
+#ifdef CONFIG_FB
+#include <linux/notifier.h>
+#include <linux/fb.h>
+#endif
 #ifdef CONFIG_ARM
 #include <asm/mach-types.h>
+#endif
+
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
+#include <linux/lcd_notify.h>
 #endif
 
 #define SYNAPTICS_CLEARPAD_VENDOR		0x1
@@ -438,9 +446,11 @@ struct synaptics_clearpad {
 	int active;
 	int irq;
 	int irq_mask;
-
-	int screen_status;
-
+#ifdef CONFIG_FB
+	struct notifier_block fb_notif;
+	struct work_struct notify_resume;
+	struct work_struct notify_suspend;
+#endif
 	char fwname[SYNAPTICS_STRING_LENGTH + 1];
 	char result_info[SYNAPTICS_STRING_LENGTH + 1];
 	wait_queue_head_t task_none_wq;
@@ -469,11 +479,85 @@ struct synaptics_clearpad {
 	const char *reset_cause;
 };
 
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
+#define DOUBLE_TAP_TO_WAKE_TIMEOUT 700
+/* Hits on different areas shouldn't register as a double tap (e.g top and bottom) */
+#define DOUBLE_TAP_TO_WAKE_FEATHER 200
+/* Screen will always be on after boot */
+bool lcd_on = true;
+static cputime64_t d2w_previous_time = 0;
+static int previous_x, previous_y;
+
+static struct evgen_record double_tap[] = {
+	{
+		.type = EVGEN_LOG,
+		.data.log.message = "=== DOUBLE TAP ===",
+	},
+	{
+		.type = EVGEN_KEY,
+		.data.key.code = KEY_POWER,
+		.data.key.down = true,
+	},
+	{
+		.type = EVGEN_KEY,
+		.data.key.code = KEY_POWER,
+		.data.key.down = false,
+	},
+	{
+		.type = EVGEN_END,
+	},
+};
+
+static struct evgen_block evgen_blocks[] = {
+	{
+		.name = "double_tap",
+		.records = double_tap,
+	},
+	{
+		.name = NULL,
+		.records = NULL,
+	}
+};
+
+static struct notifier_block d2w_lcd_notif;
+
+static int lcd_notifier_callback(struct notifier_block *this, unsigned long event, void *data)
+{
+	switch (event) {
+	case LCD_EVENT_ON_END:
+		lcd_on = true;
+		break;
+	case LCD_EVENT_OFF_END:
+		lcd_on = false;
+		d2w_previous_time = 0;
+		break;
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+/* From doubletap2wake.c */
+static unsigned int calc_feather(int coord, int prev_coord)
+{
+	int calc_coord = 0;
+	calc_coord = coord-prev_coord;
+	if (calc_coord < 0)
+		calc_coord = calc_coord * (-1);
+	return calc_coord;
+}
+
+static bool is_close_to_previous_hit(int x, int y)
+{
+	return (calc_feather(x, previous_x) < DOUBLE_TAP_TO_WAKE_FEATHER)
+		&& (calc_feather(y, previous_y) < DOUBLE_TAP_TO_WAKE_FEATHER);
+}
+#endif
+
 static void synaptics_funcarea_initialize(struct synaptics_clearpad *this);
 static void synaptics_clearpad_reset_power(struct synaptics_clearpad *this,
 					   const char *cause);
-static void synaptics_clearpad_resume(struct device *dev);
-static void synaptics_clearpad_suspend(struct device *dev);
 
 static char *make_string(u8 *array, size_t size)
 {
@@ -619,7 +703,11 @@ static int clearpad_flip_config_get(u8 module_id, u8 rev)
 
 static struct evgen_block *clearpad_evgen_block_get(u8 module_id, u8 rev)
 {
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
+	return evgen_blocks;
+#else
 	return NULL;
+#endif
 }
 
 static void synaptics_clearpad_set_irq(struct synaptics_clearpad *this,
@@ -2207,6 +2295,25 @@ static void synaptics_funcarea_up(struct synaptics_clearpad *this,
 		LOG_EVENT(this, "%s up\n", valid ? "pt" : "unused pt");
 		if (!valid)
 			break;
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
+		if (this->easy_wakeup_config.gesture_enable && !lcd_on && cur->id == 0) {
+			LOG_CHECK(this, "D2W: difference: %llu", ktime_to_ms(ktime_get()) - d2w_previous_time);
+			if ((ktime_to_ms(ktime_get()) - d2w_previous_time) > DOUBLE_TAP_TO_WAKE_TIMEOUT) {
+				/* Not sure if using this->easy_wakeup_config.timeout_delay is wise, where is it set from? */
+				d2w_previous_time = ktime_to_ms(ktime_get());
+			} else {
+				if (is_close_to_previous_hit(cur->x, cur->y)) {
+					LOG_CHECK(this, "D2W: Unlock!");
+					evgen_execute(this->input, this->evgen_blocks, "double_tap");
+				} else {
+					LOG_CHECK(this, "D2W: Second tap too far off");
+				}
+			}
+
+			previous_x = cur->x;
+			previous_y = cur->y;
+		}
+#endif
 		input_mt_slot(idev, pointer->cur.id);
 		input_mt_report_slot_state(idev, pointer->cur.tool, false);
 		break;
@@ -3114,10 +3221,6 @@ static ssize_t synaptics_clearpad_state_show(struct device *dev,
 	else if (!strncmp(attr->attr.name, __stringify(glove), PAGE_SIZE))
 		snprintf(buf, PAGE_SIZE,
 			"%d", this->glove_enabled);
-	else if (!strncmp(attr->attr.name, __stringify(screen_status),
-								PAGE_SIZE))
-		snprintf(buf, PAGE_SIZE,
-			"%d", this->screen_status);
 	else
 		snprintf(buf, PAGE_SIZE, "illegal sysfs file");
 	return strnlen(buf, PAGE_SIZE);
@@ -3194,7 +3297,11 @@ enable:
 	rc = request_threaded_irq(this->irq,
 				synaptics_clearpad_hard_handler,
 				synaptics_clearpad_threaded_handler,
-				IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+				IRQF_TRIGGER_FALLING | IRQF_ONESHOT
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
+				| IRQF_NO_SUSPEND | IRQF_EARLY_RESUME
+#endif
+				,
 				this->pdev->dev.driver->name,
 				&this->pdev->dev);
 	if (rc) {
@@ -3273,38 +3380,6 @@ static ssize_t synaptics_clearpad_wakeup_gesture_store(struct device *dev,
 	return strnlen(buf, PAGE_SIZE);
 }
 
-static ssize_t synaptics_screen_status_store(struct device *dev,
-		struct device_attribute *attr,
-		const char *buf, size_t size)
-{
-	struct synaptics_clearpad *this = dev_get_drvdata(dev);
-
-	dev_dbg(&this->pdev->dev, "%s: start\n", __func__);
-
-	LOCK(this);
-
-	if (sscanf(buf, "%d", &this->screen_status) != 1) {
-		dev_err(dev, "bad value (%s)", buf);
-		return -EINVAL;
-	}
-	dev_dbg(&this->pdev->dev, "%s: screen_status = %d\n", __func__,
-				this->screen_status);
-
-	if (this->screen_status) {
-		if (!(this->active & SYN_ACTIVE_POWER))
-			synaptics_clearpad_resume(&this->pdev->dev);
-	} else {
-		if (this->active & SYN_ACTIVE_POWER)
-			synaptics_clearpad_suspend(&this->pdev->dev);
-	}
-
-	UNLOCK(this);
-
-	synaptics_clearpad_set_power(this);
-
-	return strnlen(buf, PAGE_SIZE);
-}
-
 static struct device_attribute clearpad_sysfs_attrs[] = {
 	__ATTR(fwinfo, S_IRUGO, synaptics_clearpad_state_show, 0),
 	__ATTR(fwfamily, S_IRUGO, synaptics_clearpad_state_show, 0),
@@ -3319,8 +3394,6 @@ static struct device_attribute clearpad_sysfs_attrs[] = {
 				synaptics_clearpad_pen_enabled_store),
 	__ATTR(glove, S_IRUGO | S_IWUSR, synaptics_clearpad_state_show,
 				synaptics_clearpad_glove_enabled_store),
-	__ATTR(screen_status, S_IRUGO | S_IWUSR, synaptics_clearpad_state_show,
-				synaptics_screen_status_store)
 };
 
 static struct device_attribute clearpad_wakeup_gesture_attr =
@@ -3451,11 +3524,13 @@ static int synaptics_clearpad_input_ev_init(struct synaptics_clearpad *this)
 	return rc;
 }
 
-static void synaptics_clearpad_suspend(struct device *dev)
+static int synaptics_clearpad_suspend(struct device *dev)
 {
 	struct synaptics_clearpad *this = dev_get_drvdata(dev);
+	int rc = 0;
 	bool go_suspend;
 
+	LOCK(this);
 	go_suspend = (this->task != SYN_TASK_NO_SUSPEND);
 	if (go_suspend)
 		this->active |= SYN_STANDBY;
@@ -3464,13 +3539,21 @@ static void synaptics_clearpad_suspend(struct device *dev)
 
 	LOG_STAT(this, "active: %x (task: %s)\n",
 		 this->active, task_name[this->task]);
+	UNLOCK(this);
+
+	rc = synaptics_clearpad_set_power(this);
+	if (rc && this->reset_count >= SYNAPTICS_RETRY_NUM_OF_RESET)
+		rc = 0; /* stop retry of recovery */
+	return rc;
 }
 
-static void synaptics_clearpad_resume(struct device *dev)
+static int synaptics_clearpad_resume(struct device *dev)
 {
 	struct synaptics_clearpad *this = dev_get_drvdata(dev);
+	int rc = 0;
 	bool go_resume;
 
+	LOCK(this);
 	go_resume = !!(this->active & (SYN_STANDBY | SYN_STANDBY_AFTER_TASK));
 	if (go_resume)
 		this->active &= ~(SYN_STANDBY | SYN_STANDBY_AFTER_TASK);
@@ -3479,6 +3562,12 @@ static void synaptics_clearpad_resume(struct device *dev)
 		 this->active, task_name[this->task]);
 
 	synaptics_funcarea_invalidate_all(this);
+	UNLOCK(this);
+
+	rc = synaptics_clearpad_set_power(this);
+	if (rc && this->reset_count >= SYNAPTICS_RETRY_NUM_OF_RESET)
+		rc = 0; /* stop retry of recovery */
+	return rc;
 }
 
 static int synaptics_clearpad_pm_suspend(struct device *dev)
@@ -3496,16 +3585,12 @@ static int synaptics_clearpad_pm_suspend(struct device *dev)
 	this->dev_busy = true;
 	spin_unlock_irqrestore(&this->slock, flags);
 
-	if (this->active & SYN_ACTIVE_POWER) {
-		synaptics_clearpad_suspend(&this->pdev->dev);
-		rc = synaptics_clearpad_set_power(this);
-		if (rc) {
-			if (this->reset_count >= SYNAPTICS_RETRY_NUM_OF_RESET)
-				rc = 0; /* stop retry of recovery */
-			else
-				return rc;
-		}
-	}
+#ifdef CONFIG_FB
+	if (this->active & SYN_ACTIVE_POWER)
+#endif
+		rc = synaptics_clearpad_suspend(&this->pdev->dev);
+	if (rc)
+		return rc;
 
 	if (device_may_wakeup(dev)) {
 		enable_irq_wake(this->irq);
@@ -3537,25 +3622,67 @@ static int synaptics_clearpad_pm_resume(struct device *dev)
 		rc = synaptics_clearpad_process_irq(this);
 	}
 
-	if (irq_pending) {
-		if (!rc) {
-			synaptics_clearpad_resume(&this->pdev->dev);
-			synaptics_clearpad_set_power(this);
-		}
-	}
-
+#ifdef CONFIG_FB
+	if (irq_pending)
+#endif
+		(void)(rc ? rc : synaptics_clearpad_resume(&this->pdev->dev));
 	return 0;
 }
 
 static int synaptics_clearpad_pm_suspend_noirq(struct device *dev)
 {
 	struct synaptics_clearpad *this = dev_get_drvdata(dev);
-	if (this->irq_pending && device_may_wakeup(dev)) {
+	if ((this->irq_pending && device_may_wakeup(dev)) || this->easy_wakeup_config.gesture_enable) {
 		dev_info(&this->pdev->dev, "Need to resume\n");
 		return -EBUSY;
 	}
 	return 0;
 }
+
+#ifdef CONFIG_FB
+static void synaptics_notify_resume(struct work_struct *work)
+{
+	struct synaptics_clearpad *this = container_of(work,
+			struct synaptics_clearpad, notify_resume);
+
+	if (!(this->active & SYN_ACTIVE_POWER))
+		synaptics_clearpad_resume(&this->pdev->dev);
+}
+
+static void synaptics_notify_suspend(struct work_struct *work)
+{
+	struct synaptics_clearpad *this = container_of(work,
+			struct synaptics_clearpad, notify_suspend);
+
+	if (this->active & SYN_ACTIVE_POWER)
+		synaptics_clearpad_suspend(&this->pdev->dev);
+}
+
+static int synaptics_fb_notifier_callback(struct notifier_block *self,
+				unsigned long event, void *data)
+{
+	struct fb_event *evdata = data;
+	int *blank;
+	struct synaptics_clearpad *this =
+		container_of(self, struct synaptics_clearpad, fb_notif);
+
+	if (evdata && evdata->data && event == FB_EVENT_BLANK && this &&
+			this->pdev) {
+		blank = evdata->data;
+		if (*blank == FB_BLANK_UNBLANK) {
+			cancel_work_sync(&this->notify_suspend);
+			cancel_work_sync(&this->notify_resume);
+			schedule_work(&this->notify_resume);
+		} else if (*blank == FB_BLANK_POWERDOWN) {
+			cancel_work_sync(&this->notify_resume);
+			cancel_work_sync(&this->notify_suspend);
+			schedule_work(&this->notify_suspend);
+		}
+	}
+
+	return 0;
+}
+#endif
 
 #ifdef CONFIG_DEBUG_FS
 static int clearpad_get_num_tx_physical(struct synaptics_clearpad *this,
@@ -4129,6 +4256,11 @@ static int __devinit clearpad_probe(struct platform_device *pdev)
 			this->pdata->easy_wakeup_config,
 			sizeof(this->easy_wakeup_config));
 
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
+	this->easy_wakeup_config.gesture_enable = true;
+	this->easy_wakeup_config.timeout_delay = DOUBLE_TAP_TO_WAKE_TIMEOUT;
+#endif
+
 #ifdef CONFIG_TOUCHSCREEN_CLEARPAD_RMI_DEV
 	if (!cdata->rmi_dev) {
 		rmi_dev = platform_device_alloc(CLEARPAD_RMI_DEV_NAME, -1);
@@ -4232,10 +4364,21 @@ static int __devinit clearpad_probe(struct platform_device *pdev)
 
 	this->state = SYN_STATE_RUNNING;
 
+#ifdef CONFIG_FB
+	this->fb_notif.notifier_call = synaptics_fb_notifier_callback;
+	rc = fb_register_client(&this->fb_notif);
+	if (rc) {
+		dev_err(&this->pdev->dev, "Unable to register fb_notifier\n");
+	} else {
+		INIT_WORK(&this->notify_resume, synaptics_notify_resume);
+		INIT_WORK(&this->notify_suspend, synaptics_notify_suspend);
+	}
+#endif
+
 	/* sysfs */
 	rc = create_sysfs_entries(this);
 	if (rc)
-		goto err_input_device_pen;
+		goto err_unregister_fb;
 
 #ifdef CONFIG_DEBUG_FS
 	/* debugfs */
@@ -4255,7 +4398,11 @@ static int __devinit clearpad_probe(struct platform_device *pdev)
 	rc = request_threaded_irq(this->irq,
 				synaptics_clearpad_hard_handler,
 				synaptics_clearpad_threaded_handler,
-				IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+				IRQF_TRIGGER_FALLING | IRQF_ONESHOT
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
+				| IRQF_NO_SUSPEND | IRQF_EARLY_RESUME
+#endif
+				,
 				this->pdev->dev.driver->name,
 				&this->pdev->dev);
 	if (rc) {
@@ -4281,6 +4428,10 @@ err_sysfs_remove_group:
 	debugfs_remove_recursive(this->debugfs);
 #endif
 	remove_sysfs_entries(this);
+err_unregister_fb:
+#ifdef CONFIG_FB
+	fb_unregister_client(&this->fb_notif);
+#endif
 err_input_device_pen:
 	input_unregister_device(this->input_pen);
 err_input_device:
@@ -4327,6 +4478,11 @@ static int __devexit clearpad_remove(struct platform_device *pdev)
 	debugfs_remove_recursive(this->debugfs);
 #endif
 	remove_sysfs_entries(this);
+#ifdef CONFIG_FB
+	fb_unregister_client(&this->fb_notif);
+	cancel_work_sync(&this->notify_resume);
+	cancel_work_sync(&this->notify_suspend);
+#endif
 	input_unregister_device(this->input);
 	input_unregister_device(this->input_pen);
 	clearpad_gpio_configure(this, 0);
@@ -4359,11 +4515,18 @@ static struct platform_driver clearpad_driver = {
 
 static int __init clearpad_init(void)
 {
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
+	d2w_lcd_notif.notifier_call = lcd_notifier_callback;
+	lcd_register_client(&d2w_lcd_notif);
+#endif
 	return platform_driver_register(&clearpad_driver);
 }
 
 static void __exit clearpad_exit(void)
 {
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
+	lcd_unregister_client(&d2w_lcd_notif);
+#endif
 	platform_driver_unregister(&clearpad_driver);
 }
 
