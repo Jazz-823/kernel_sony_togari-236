@@ -564,4 +564,3 @@ late_initcall(kcal_ctrl_init);
 module_exit(kcal_ctrl_exit);
 
 MODULE_DESCRIPTION("MDSS-MDP5 KCAL Driver");
-
