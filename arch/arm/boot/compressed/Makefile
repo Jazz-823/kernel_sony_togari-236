@@ -96,8 +96,8 @@ suffix_$(CONFIG_KERNEL_GZIP) = gzip
 suffix_$(CONFIG_KERNEL_LZO)  = lzo
 suffix_$(CONFIG_KERNEL_LZMA) = lzma
 suffix_$(CONFIG_KERNEL_XZ)   = xzkern
-suffix_$(CONFIG_KERNEL_LZ4)  = lz4 
- 
+suffix_$(CONFIG_KERNEL_LZ4)  = lz4
+
 # Borrowed libfdt files for the ATAG compatibility mode
 
 libfdt		:= fdt_rw.c fdt_ro.c fdt_wip.c fdt.c
@@ -124,7 +124,6 @@ targets       := vmlinux vmlinux.lds \
 extra-y       += piggy.gzip piggy.lzo piggy.lzma piggy.xzkern piggy.lz4 \
 		 lib1funcs.S ashldi3.S $(libfdt) $(libfdt_hdrs) \
 		 hyp-stub.S
-
 
 ifeq ($(CONFIG_FUNCTION_TRACER),y)
 ORIG_CFLAGS := $(KBUILD_CFLAGS)
