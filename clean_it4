@@ -1,0 +1,8 @@
+### GCC 4.9.x
+
+### clean
+ARCH=arm CROSS_COMPILE=~/android_prebuilt_toolchains/arm-cortex_a15-linux-gnueabihf-linaro_4.9.1/bin/arm-cortex_a15-linux-gnueabihf- make distclean
+
+### delete additional generated files
+rm ./arch/arm/boot/zImage-dtb
+rm ./arch/arm/mach-msm/smd_rpc_sym.c
